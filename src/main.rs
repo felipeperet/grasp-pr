@@ -1,5 +1,8 @@
 use clap::{ArgAction, CommandFactory, Parser};
+use rayon::prelude::*;
 use std::fs;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
 
 struct Instance {
     num_cities: usize,
@@ -62,27 +65,62 @@ impl Solution {
 
 /// GRASP algorithm implementation
 fn grasp(instance: &Instance, iterations: u32) -> Solution {
-    let mut best_solution = Solution::new(instance.num_cities);
-    let mut best_score = i32::MAX;
+    let best_score = Arc::new(AtomicI32::new(i32::MAX));
 
-    for iteration in 0..iterations {
-        let mut solution = constructive_phase(instance);
-        solution.eval(instance);
+    (0..iterations)
+        .into_par_iter()
+        .map(|_| {
+            let mut solution = constructive_phase(instance);
 
-        if solution.total_distance < best_score {
-            best_score = solution.total_distance;
-            best_solution = solution;
+            local_search(&mut solution, instance);
+            solution.eval(instance);
 
-            // Trace the new best solution
-            println!(
-                "Improvement at iteration {}: distance = {}",
-                iteration + 1,
-                best_solution.total_distance,
-            );
+            let current_best_score = best_score.load(Ordering::Relaxed);
+            if solution.total_distance < current_best_score {
+                best_score.store(solution.total_distance, Ordering::Relaxed);
+
+                println!("Improved distance = {}", solution.total_distance);
+            }
+
+            solution
+        })
+        .reduce_with(|best_solution, solution| {
+            if solution.total_distance < best_solution.total_distance {
+                solution
+            } else {
+                best_solution
+            }
+        })
+        .expect("GRASP should return at least one solution")
+}
+
+// Local search implementation using 2-opt
+fn local_search(solution: &mut Solution, instance: &Instance) {
+    let mut improvement = true;
+
+    while improvement {
+        improvement = false;
+
+        for i in 1..solution.path.len() - 1 {
+            for j in i + 1..solution.path.len() {
+                if j - i == 1 {
+                    continue;
+                }
+
+                let old_distance = instance.distances[solution.path[i - 1]][solution.path[i]]
+                    + instance.distances[solution.path[j - 1]][solution.path[j]];
+                let new_distance = instance.distances[solution.path[i - 1]][solution.path[j - 1]]
+                    + instance.distances[solution.path[i]][solution.path[j]];
+
+                if new_distance < old_distance {
+                    solution.path[i..j].reverse();
+                    solution.eval(instance);
+
+                    improvement = true;
+                }
+            }
         }
     }
-
-    best_solution
 }
 
 /// Constructive phase of GRASP
@@ -90,20 +128,17 @@ fn constructive_phase(instance: &Instance) -> Solution {
     let mut solution = Solution::new(instance.num_cities);
     let mut remaining: Vec<usize> = (0..instance.num_cities).collect();
 
-    // Start from a random city
     let start_city = remaining.remove(rand::random::<usize>() % remaining.len());
     solution.path.push(start_city);
 
     while !remaining.is_empty() {
         let last_city = *solution.path.last().unwrap();
-        // Choose the next city with a greedy + random criterion
         let mut candidates: Vec<(usize, i32)> = remaining
             .iter()
             .map(|&city| (city, instance.distances[last_city][city]))
             .collect();
         candidates.sort_by_key(|&(_, dist)| dist);
 
-        // Select next city randomly among top candidates
         let next_city = candidates[rand::random::<usize>() % candidates.len()].0;
         remaining.retain(|&x| x != next_city);
         solution.path.push(next_city);
