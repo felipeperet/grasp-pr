@@ -1,8 +1,11 @@
-use clap::{ArgAction, CommandFactory, Parser};
+use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
 use rayon::prelude::*;
+use std::fmt;
 use std::fs;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 struct Instance {
     num_cities: usize,
@@ -119,6 +122,7 @@ impl Instance {
     }
 }
 
+#[derive(Clone)]
 struct Solution {
     path: Vec<usize>,
     total_distance: i32,
@@ -148,40 +152,169 @@ impl Solution {
         let first = self.path[0];
         self.total_distance += instance.distances[last][first]
     }
+
+    fn copy(&self) -> Self {
+        Solution {
+            path: self.path.clone(),
+            total_distance: self.total_distance,
+        }
+    }
+
+    // fn path_relinking(&mut self, target: &Solution, instance: &Instance) {
+    //     for i in 0..self.path.len() {
+    //         if self.path[i] != target.path[i] {
+    //             let target_index = self.path.iter().position(|&x| x == target.path[i]).unwrap();
+    //             self.path.swap(i, target_index);
+    //             self.eval(instance);
+    //
+    //             if self.total_distance < target.total_distance {
+    //                 break;
+    //             }
+    //         }
+    //     }
+    // }
+
+    fn path_relinking(&mut self, target: &Solution, instance: &Instance) {
+        let mut best_distance = self.total_distance;
+        let mut best_path = self.path.clone();
+
+        for i in 0..self.path.len() {
+            if self.path[i] != target.path[i] {
+                let target_index = self.path.iter().position(|&x| x == target.path[i]).unwrap();
+                self.path.swap(i, target_index);
+                self.eval(instance);
+
+                local_search(self, instance);
+
+                if self.total_distance < best_distance {
+                    best_distance = self.total_distance;
+                    best_path = self.path.clone();
+                }
+            }
+        }
+
+        self.path = best_path;
+        self.total_distance = best_distance;
+    }
 }
 
-/// GRASP algorithm implementation
-fn grasp(instance: &Instance, iterations: u32) -> Solution {
+fn grasp(instance: &Instance, time_limit: Duration) -> Solution {
     let best_score = Arc::new(AtomicI32::new(i32::MAX));
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let start_time = Instant::now();
 
-    (0..iterations)
+    let best_solution = (0..num_cpus::get())
         .into_par_iter()
         .map(|_| {
-            let mut solution = constructive_phase(instance);
+            while !stop_flag.load(Ordering::Relaxed) {
+                if start_time.elapsed() >= time_limit {
+                    stop_flag.store(true, Ordering::Relaxed);
+                    break;
+                }
 
-            local_search(&mut solution, instance);
-            solution.eval(instance);
+                let mut solution = constructive_phase(instance);
+                local_search(&mut solution, instance);
+                solution.eval(instance);
 
-            let current_best_score = best_score.load(Ordering::Relaxed);
-            if solution.total_distance < current_best_score {
-                best_score.store(solution.total_distance, Ordering::Relaxed);
-
-                println!("Improved distance = {}", solution.total_distance);
+                let current_best_score = best_score.load(Ordering::Relaxed);
+                if solution.total_distance < current_best_score {
+                    best_score.store(solution.total_distance, Ordering::Relaxed);
+                    println!("Improved distance = {}", solution.total_distance);
+                }
             }
+            best_score.load(Ordering::Relaxed)
+        })
+        .reduce_with(|best, _| best);
 
-            solution
-        })
-        .reduce_with(|best_solution, solution| {
-            if solution.total_distance < best_solution.total_distance {
-                solution
-            } else {
-                best_solution
-            }
-        })
-        .expect("GRASP should return at least one solution")
+    let mut final_solution = constructive_phase(instance);
+    final_solution.total_distance =
+        best_solution.expect("GRASP should return at least one solution");
+    final_solution
 }
 
-// Local search implementation using 2-opt
+fn grasp_static_pr(instance: &Instance, time_limit: Duration, elite_size: usize) -> Solution {
+    let elite_set = Arc::new(Mutex::new(Vec::with_capacity(elite_size)));
+    let best_score = Arc::new(AtomicI32::new(i32::MAX));
+    let best_solution = Arc::new(Mutex::new(None));
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let start_time = Instant::now();
+
+    let _ = (0..num_cpus::get())
+        .into_par_iter()
+        .map(|_| {
+            while !stop_flag.load(Ordering::Relaxed) {
+                if start_time.elapsed() >= time_limit {
+                    stop_flag.store(true, Ordering::Relaxed);
+                    break;
+                }
+
+                let mut solution = constructive_phase(instance);
+                local_search(&mut solution, instance);
+                solution.eval(instance);
+
+                let current_best_score = best_score.load(Ordering::Relaxed);
+                if solution.total_distance < current_best_score {
+                    best_score.store(solution.total_distance, Ordering::Relaxed);
+                    *best_solution.lock().unwrap() = Some(solution.copy());
+                    println!("Improved distance = {}", solution.total_distance);
+                }
+
+                let mut elite_set = elite_set.lock().unwrap();
+                if elite_set.len() < elite_size {
+                    elite_set.push(solution.copy());
+                } else {
+                    let worst_index = elite_set
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|&(_, sol)| sol.total_distance)
+                        .map(|(i, _)| i)
+                        .unwrap();
+                    if solution.total_distance < elite_set[worst_index].total_distance {
+                        elite_set[worst_index] = solution.copy();
+                    }
+                }
+            }
+            best_score.load(Ordering::Relaxed)
+        })
+        .reduce_with(|best, _| best);
+
+    {
+        let elite_set = elite_set.lock().unwrap();
+        elite_set.par_iter().enumerate().for_each(|(i, _)| {
+            if stop_flag.load(Ordering::Relaxed) {
+                return;
+            }
+
+            for j in i + 1..elite_set.len() {
+                let mut s = elite_set[i].copy();
+                s.path_relinking(&elite_set[j], instance);
+
+                local_search(&mut s, instance);
+
+                let current_best_score = best_score.load(Ordering::Relaxed);
+                if s.total_distance < current_best_score {
+                    best_score.store(s.total_distance, Ordering::Relaxed);
+                    *best_solution.lock().unwrap() = Some(s.copy());
+                    println!("Improved distance = {}", s.total_distance);
+                }
+
+                if start_time.elapsed() >= time_limit {
+                    stop_flag.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        });
+    }
+
+    let final_solution = best_solution
+        .lock()
+        .unwrap()
+        .take()
+        .expect("There should be at least one solution");
+    final_solution
+}
+
+/// Local search implementation using 2-opt
 fn local_search(solution: &mut Solution, instance: &Instance) {
     let mut improvement = true;
 
@@ -250,6 +383,21 @@ fn list_available_instances() -> String {
     instances
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+enum GraspVariant {
+    Basic,
+    StaticPR,
+}
+
+impl fmt::Display for GraspVariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GraspVariant::Basic => write!(f, "Basic"),
+            GraspVariant::StaticPR => write!(f, "StaticPR"),
+        }
+    }
+}
+
 /// Command-line interface (CLI) options.
 #[derive(Parser)]
 #[command(name = "GRASP TSP Solver")]
@@ -264,6 +412,14 @@ struct Cli {
     /// Number of iterations for the GRASP algorithm.
     #[arg(short = 'i', long, default_value_t = 1000)]
     iterations: u32,
+
+    /// Variant of the GRASP to be used.
+    #[arg(short = 'v', long, default_value = "basic")]
+    variant: GraspVariant,
+
+    /// Size of the elite set for StaticPR (ignored for Basic).
+    #[arg(short = 'e', long, default_value_t = 10)]
+    elite_size: usize,
 
     /// Execute with default settings.
     #[arg(short = 'd', long, default_value_t = false, action = ArgAction::SetTrue)]
@@ -294,14 +450,28 @@ fn main() {
     if cli.default {
         cli.instance_file = "instances/bays29.tsp".to_string();
         cli.iterations = 1000;
+        cli.variant = GraspVariant::Basic
     }
 
     let instance = Instance::load(&cli.instance_file);
 
     println!("Instance file: {}", cli.instance_file);
     println!("Number of iterations: {}\n", cli.iterations);
+    println!("Variant: {}\n", cli.variant);
 
-    let best_solution = grasp(&instance, cli.iterations);
+    match cli.variant {
+        GraspVariant::StaticPR => {
+            println!("Elite Size: {}\n", cli.elite_size);
+        }
+        _ => {}
+    }
+
+    let best_solution = match cli.variant {
+        GraspVariant::Basic => grasp(&instance, Duration::from_secs(90)),
+        GraspVariant::StaticPR => {
+            grasp_static_pr(&instance, Duration::from_secs(90), cli.elite_size)
+        }
+    };
 
     println!("\nBest solution found: {:?}", best_solution.path);
     println!("Total distance: {}", best_solution.total_distance);
