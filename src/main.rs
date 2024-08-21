@@ -176,6 +176,10 @@ impl Solution {
                     best_distance = self.total_distance;
                     best_path = self.path.clone();
                 }
+
+                if best_distance == self.total_distance {
+                    break;
+                }
             }
         }
 
@@ -230,7 +234,7 @@ fn update_elite_set(
     elite_set: &mut Vec<Solution>,
     solution: Solution,
     max_elite_size: usize,
-    min_difference: usize, // This parameter is still needed within this function
+    min_difference: usize,
 ) {
     if elite_set.is_empty() {
         elite_set.push(solution);
@@ -259,7 +263,7 @@ fn update_elite_set(
 }
 
 fn grasp_static_pr(instance: &Instance, time_limit: Duration, elite_size: usize) -> Solution {
-    let min_difference = (instance.num_cities as f64 * 0.1).round() as usize; // 10% of the number of cities
+    let min_difference = (instance.num_cities as f64 * 0.1).round() as usize;
 
     let elite_set = Arc::new(Mutex::new(Vec::with_capacity(elite_size)));
     let best_score = Arc::new(AtomicI32::new(i32::MAX));
@@ -425,9 +429,9 @@ struct Cli {
     #[arg(short = 'f', long, default_value_t = String::from("instances/bays29.txt"))]
     instance_file: String,
 
-    /// Number of iterations for the GRASP algorithm.
-    #[arg(short = 'i', long, default_value_t = 1000)]
-    iterations: u32,
+    /// Time limit for the GRASP algorithm in seconds.
+    #[arg(short = 't', long, default_value_t = 120)]
+    time_limit: u64,
 
     /// Variant of the GRASP to be used.
     #[arg(short = 'v', long, default_value = "basic")]
@@ -464,15 +468,15 @@ fn main() {
     }
 
     if cli.default {
-        cli.instance_file = "instances/bays29.tsp".to_string();
-        cli.iterations = 1000;
-        cli.variant = GraspVariant::Basic
+        cli.instance_file = "instances/bier127.tsp".to_string();
+        cli.time_limit = 120;
+        cli.variant = GraspVariant::Basic;
     }
 
     let instance = Instance::load(&cli.instance_file);
 
     println!("Instance file: {}", cli.instance_file);
-    println!("Number of iterations: {}\n", cli.iterations);
+    println!("Time limit: {} seconds\n", cli.time_limit);
     println!("Variant: {}\n", cli.variant);
 
     match cli.variant {
@@ -482,11 +486,11 @@ fn main() {
         _ => {}
     }
 
+    let time_limit = Duration::from_secs(cli.time_limit);
+
     let best_solution = match cli.variant {
-        GraspVariant::Basic => grasp(&instance, Duration::from_secs(90)),
-        GraspVariant::StaticPR => {
-            grasp_static_pr(&instance, Duration::from_secs(90), cli.elite_size)
-        }
+        GraspVariant::Basic => grasp(&instance, time_limit),
+        GraspVariant::StaticPR => grasp_static_pr(&instance, time_limit, cli.elite_size),
     };
 
     println!("\nBest solution found: {:?}", best_solution.path);
