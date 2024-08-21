@@ -160,20 +160,6 @@ impl Solution {
         }
     }
 
-    // fn path_relinking(&mut self, target: &Solution, instance: &Instance) {
-    //     for i in 0..self.path.len() {
-    //         if self.path[i] != target.path[i] {
-    //             let target_index = self.path.iter().position(|&x| x == target.path[i]).unwrap();
-    //             self.path.swap(i, target_index);
-    //             self.eval(instance);
-    //
-    //             if self.total_distance < target.total_distance {
-    //                 break;
-    //             }
-    //         }
-    //     }
-    // }
-
     fn path_relinking(&mut self, target: &Solution, instance: &Instance) {
         let mut best_distance = self.total_distance;
         let mut best_path = self.path.clone();
@@ -232,7 +218,49 @@ fn grasp(instance: &Instance, time_limit: Duration) -> Solution {
     final_solution
 }
 
+fn symmetric_difference(sol1: &Solution, sol2: &Solution) -> usize {
+    sol1.path
+        .iter()
+        .zip(sol2.path.iter())
+        .filter(|&(a, b)| a != b)
+        .count()
+}
+
+fn update_elite_set(
+    elite_set: &mut Vec<Solution>,
+    solution: Solution,
+    max_elite_size: usize,
+    min_difference: usize, // This parameter is still needed within this function
+) {
+    if elite_set.is_empty() {
+        elite_set.push(solution);
+        return;
+    }
+
+    let is_different = elite_set
+        .iter()
+        .all(|s| symmetric_difference(&s, &solution) >= min_difference);
+
+    if is_different {
+        if elite_set.len() < max_elite_size {
+            elite_set.push(solution);
+        } else {
+            let worst_index = elite_set
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, sol)| sol.total_distance)
+                .map(|(i, _)| i)
+                .unwrap();
+            if solution.total_distance < elite_set[worst_index].total_distance {
+                elite_set[worst_index] = solution;
+            }
+        }
+    }
+}
+
 fn grasp_static_pr(instance: &Instance, time_limit: Duration, elite_size: usize) -> Solution {
+    let min_difference = (instance.num_cities as f64 * 0.1).round() as usize; // 10% of the number of cities
+
     let elite_set = Arc::new(Mutex::new(Vec::with_capacity(elite_size)));
     let best_score = Arc::new(AtomicI32::new(i32::MAX));
     let best_solution = Arc::new(Mutex::new(None));
@@ -260,19 +288,7 @@ fn grasp_static_pr(instance: &Instance, time_limit: Duration, elite_size: usize)
                 }
 
                 let mut elite_set = elite_set.lock().unwrap();
-                if elite_set.len() < elite_size {
-                    elite_set.push(solution.copy());
-                } else {
-                    let worst_index = elite_set
-                        .iter()
-                        .enumerate()
-                        .max_by_key(|&(_, sol)| sol.total_distance)
-                        .map(|(i, _)| i)
-                        .unwrap();
-                    if solution.total_distance < elite_set[worst_index].total_distance {
-                        elite_set[worst_index] = solution.copy();
-                    }
-                }
+                update_elite_set(&mut elite_set, solution.copy(), elite_size, min_difference);
             }
             best_score.load(Ordering::Relaxed)
         })
