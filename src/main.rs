@@ -2,6 +2,8 @@ use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
 use rayon::prelude::*;
 use std::fmt;
 use std::fs;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -334,35 +336,38 @@ fn grasp_static_pr(instance: &Instance, time_limit: Duration, elite_size: usize)
     final_solution
 }
 
-/// Local search implementation using Swap
+/// Local search implementation using Swap (1-opt)
 fn local_search_swap(solution: &mut Solution, instance: &Instance) {
     let mut improvement = true;
 
     while improvement {
         improvement = false;
 
-        // Iterate through all pairs of distinct vertices
-        for i in 0..solution.path.len() - 1 {
-            for j in i + 1..solution.path.len() {
-                // Swap vertices at positions i and j
+        for i in 1..solution.path.len() - 1 {
+            for j in i + 1..solution.path.len() - 1 {
+                let current_cost = instance.distances[solution.path[i - 1]][solution.path[i]]
+                    + instance.distances[solution.path[i]][solution.path[i + 1]]
+                    + instance.distances[solution.path[j - 1]][solution.path[j]]
+                    + instance.distances[solution.path[j]][solution.path[j + 1]];
+
                 solution.path.swap(i, j);
 
-                // Evaluate the new solution
-                solution.eval(instance);
+                let new_cost = instance.distances[solution.path[i - 1]][solution.path[i]]
+                    + instance.distances[solution.path[i]][solution.path[i + 1]]
+                    + instance.distances[solution.path[j - 1]][solution.path[j]]
+                    + instance.distances[solution.path[j]][solution.path[j + 1]];
 
-                // If there's an improvement, keep the swap
-                if solution.total_distance < instance.distances[solution.path[i]][solution.path[j]]
-                {
+                if new_cost < current_cost {
                     improvement = true;
-                    break; // Restart the loop from the beginning
+                    solution.eval(instance);
+                    break;
                 } else {
-                    // Revert if no improvement
                     solution.path.swap(i, j);
                 }
             }
 
             if improvement {
-                break; // Restart the search from the beginning if there was an improvement
+                break;
             }
         }
     }
@@ -381,7 +386,6 @@ fn local_search_2opt(solution: &mut Solution, instance: &Instance) {
                     continue;
                 }
 
-                // Calculate the cost difference before and after reversing
                 let current_cost = instance.distances[solution.path[i - 1]][solution.path[i]]
                     + instance.distances[solution.path[j - 1]][solution.path[j]];
                 let new_cost = instance.distances[solution.path[i - 1]][solution.path[j - 1]]
@@ -389,14 +393,14 @@ fn local_search_2opt(solution: &mut Solution, instance: &Instance) {
 
                 if new_cost < current_cost {
                     solution.path[i..j].reverse();
-                    solution.eval(instance); // Evaluate only if there was an improvement
+                    solution.eval(instance);
                     improvement = true;
-                    break; // Exit early to restart from the beginning
+                    break;
                 }
             }
 
             if improvement {
-                break; // Restart the search from the beginning if there was any improvement
+                break;
             }
         }
     }
@@ -428,39 +432,57 @@ fn constructive_phase(instance: &Instance) -> Solution {
     solution
 }
 
-fn benchmark_local_search(instance: &Instance) {
-    // Inicializa uma solução de teste
-    let solution = constructive_phase(instance);
+fn benchmark_local_search(instance: &Instance, instance_name: &str, num_runs: usize) {
+    let mut results = vec![];
 
-    println!("\n=== Benchmarking 2-opt ===");
-    let mut solution_2opt = solution.copy();
-    let start_2opt = Instant::now();
-    local_search_2opt(&mut solution_2opt, instance);
-    let duration_2opt = start_2opt.elapsed();
-    println!(
-        "2-opt: Distance = {}, Time = {:.2?}",
-        solution_2opt.total_distance, duration_2opt
-    );
+    for run in 1..=num_runs {
+        println!("\n=== Run {} for 2-opt ===", run);
+        let mut solution_2opt = constructive_phase(instance);
+        let start_2opt = Instant::now();
+        local_search_2opt(&mut solution_2opt, instance);
+        let duration_2opt = start_2opt.elapsed();
 
-    println!("\n=== Benchmarking Swap ===");
-    let mut solution_swap = solution.copy();
-    let start_swap = Instant::now();
-    local_search_swap(&mut solution_swap, instance);
-    let duration_swap = start_swap.elapsed();
-    println!(
-        "Swap: Distance = {}, Time = {:.2?}",
-        solution_swap.total_distance, duration_swap
-    );
+        println!(
+            "2-opt: Distance = {}, Time = {:.2?}",
+            solution_2opt.total_distance, duration_2opt
+        );
 
-    println!("\nBenchmark Results:");
-    println!(
-        "2-opt: Distance = {}, Time = {:.2?}",
-        solution_2opt.total_distance, duration_2opt
-    );
-    println!(
-        "Swap: Distance = {}, Time = {:.2?}",
-        solution_swap.total_distance, duration_swap
-    );
+        println!("\n=== Run {} for Swap ===", run);
+        let mut solution_swap = constructive_phase(instance);
+        let start_swap = Instant::now();
+        local_search_swap(&mut solution_swap, instance);
+        let duration_swap = start_swap.elapsed();
+
+        println!(
+            "Swap: Distance = {}, Time = {:.2?}",
+            solution_swap.total_distance, duration_swap
+        );
+
+        results.push((
+            run,
+            solution_2opt.total_distance,
+            duration_2opt.as_micros(),
+            solution_swap.total_distance,
+            duration_swap.as_micros(),
+        ));
+    }
+
+    let file_path = format!("{}_benchmark_results.csv", instance_name);
+    let file = File::create(&file_path).expect("Unable to create file");
+    let mut writer = BufWriter::new(file);
+
+    writeln!(
+        writer,
+        "Run,2-opt Distance,2-opt Time (µs),Swap Distance,Swap Time (µs)"
+    )
+    .expect("Failed to write header to CSV");
+
+    for (run, d2opt, t2opt, dswap, tswap) in results {
+        writeln!(writer, "{},{},{},{},{}", run, d2opt, t2opt, dswap, tswap)
+            .expect("Failed to write results to CSV");
+    }
+
+    println!("Benchmark results saved to {}", file_path);
 }
 
 fn list_available_instances() -> String {
@@ -551,34 +573,40 @@ fn main() {
         cli.variant = GraspVariant::Basic;
     }
 
-    let instance = Instance::load(&cli.instance_file);
-
-    println!("Instance file: {}", cli.instance_file);
-    println!("Time limit: {} seconds\n", cli.time_limit);
-    println!("Variant: {}\n", cli.variant);
-
     match cli.variant {
-        GraspVariant::StaticPR => {
-            println!("Elite Size: {}\n", cli.elite_size);
-        }
-        _ => {}
-    }
-
-    let time_limit = Duration::from_secs(cli.time_limit);
-
-    match cli.variant {
-        GraspVariant::Basic => {
-            let best_solution = grasp(&instance, time_limit);
-            println!("\nBest solution found: {:?}", best_solution.path);
-            println!("Total distance: {}", best_solution.total_distance);
-        }
-        GraspVariant::StaticPR => {
-            let best_solution = grasp_static_pr(&instance, time_limit, cli.elite_size);
-            println!("\nBest solution found: {:?}", best_solution.path);
-            println!("Total distance: {}", best_solution.total_distance);
-        }
         GraspVariant::Benchmark => {
-            benchmark_local_search(&instance);
+            let instances = vec!["instances/bays29.tsp", "instances/brg180.tsp"];
+
+            for instance_file in &instances {
+                println!("\nRunning benchmark for instance: {}\n", instance_file);
+
+                let instance = Instance::load(instance_file);
+                let instance_name = if instance_file.contains("bays29") {
+                    "bays29"
+                } else if instance_file.contains("brg180") {
+                    "brg180"
+                } else {
+                    "unknown_instance"
+                };
+
+                benchmark_local_search(&instance, instance_name, 100);
+            }
+        }
+        GraspVariant::Basic => {
+            let instance = Instance::load(&cli.instance_file);
+            let best_solution = grasp(&instance, Duration::from_secs(cli.time_limit));
+            println!("\nBest solution found: {:?}", best_solution.path);
+            println!("Total distance: {}", best_solution.total_distance);
+        }
+        GraspVariant::StaticPR => {
+            let instance = Instance::load(&cli.instance_file);
+            let best_solution = grasp_static_pr(
+                &instance,
+                Duration::from_secs(cli.time_limit),
+                cli.elite_size,
+            );
+            println!("\nBest solution found: {:?}", best_solution.path);
+            println!("Total distance: {}", best_solution.total_distance);
         }
     }
 }
